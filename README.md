@@ -110,7 +110,6 @@ python3 build-system/Make/Make.py \
 ## Versions
 
 Each release is built using a specific Xcode version (see `versions.json`). The helper script checks the versions of the installed software and reports an error if they don't match the ones specified in `versions.json`. It is possible to bypass these checks:
-
 ```
 python3 build-system/Make/Make.py --overrideXcodeVersion build ... # Don't check the version of Xcode
 ```
