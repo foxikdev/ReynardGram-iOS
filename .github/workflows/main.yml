@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [ master ]
+    branches: [master]
   workflow_dispatch:
 
 concurrency:
@@ -17,8 +17,8 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
         with:
-          submodules: 'recursive'
-          fetch-depth: '500'
+          submodules: recursive
+          fetch-depth: 500
 
       - name: Fix Submodule URLs
         run: |
@@ -29,70 +29,94 @@ jobs:
 
       - name: Set active Xcode path
         run: |
-          XCODE_VERSION=$(cat versions.json | python3 -c 'import json,sys;obj=json.load(sys.stdin);print(obj["xcode"]);')
-          sudo xcode-select -s /Applications/Xcode_$XCODE_VERSION.app/Contents/Developer
+          XCODE_VERSION=$(python3 -c 'import json; print(json.load(open("versions.json"))["xcode"])')
+          sudo xcode-select -s "/Applications/Xcode_$XCODE_VERSION.app/Contents/Developer"
 
-      - name: Clean stale Bazel cache (this runner is reused across runs; many past pushes cancelled in-progress builds and may have left corrupted cache entries)
-        run: |
-          set -x
-          BAZEL_USER_ROOT="/private/var/tmp/_bazel_containerhost"
-          cd "$GITHUB_WORKSPACE"
-          python3 -u build-system/Make/Make.py --bazelUserRoot="$BAZEL_USER_ROOT" clean || true
+      # A new cache generation is created once a week. Builds during the same
+      # week reuse it, avoiding a new multi-gigabyte upload after every run.
+      - name: Generate Bazel cache key
+        id: bazel-cache-key
+        run: echo "week=$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore Bazel disk cache
+        uses: actions/cache@v4
+        with:
+          path: /Users/runner/bazel-disk-cache
+          key: reynard-bazel-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('versions.json') }}-${{ steps.bazel-cache-key.outputs.week }}
+          restore-keys: |
+            reynard-bazel-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('versions.json') }}-
+            reynard-bazel-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Create canonical source directory
         run: |
           set -x
           sudo mkdir -p /Users/Shared
-          cp -R $GITHUB_WORKSPACE /Users/Shared/
-          mv /Users/Shared/$(basename $GITHUB_WORKSPACE) /Users/Shared/telegram-ios
+          sudo rm -rf /Users/Shared/telegram-ios
+          cp -R "$GITHUB_WORKSPACE" /Users/Shared/telegram-ios
 
       - name: Build the App
         run: |
           set -x
-          SOURCE_DIR=/Users/Shared/telegram-ios
+          SOURCE_DIR="/Users/Shared/telegram-ios"
           BAZEL_USER_ROOT="/private/var/tmp/_bazel_containerhost"
-          cd $SOURCE_DIR
-          BUILD_NUMBER_OFFSET="$(cat build_number_offset)"
-          export APP_VERSION=$(cat versions.json | python3 -c 'import json,sys;obj=json.load(sys.stdin);print(obj["app"]);')
-          export COMMIT_COUNT=$(git rev-list --count HEAD)
-          export COMMIT_COUNT="$(($COMMIT_COUNT+$BUILD_NUMBER_OFFSET))"
-          export BUILD_NUMBER="$COMMIT_COUNT"
-          echo "BUILD_NUMBER=$BUILD_NUMBER" >> $GITHUB_ENV
-          echo "APP_VERSION=$APP_VERSION" >> $GITHUB_ENV
+          BAZEL_DISK_CACHE="/Users/runner/bazel-disk-cache"
 
-          python3 build-system/Make/ImportCertificates.py --path build-system/fake-codesigning/certs
+          cd "$SOURCE_DIR"
+          mkdir -p "$BAZEL_DISK_CACHE"
+
+          BUILD_NUMBER_OFFSET=$(cat build_number_offset)
+          APP_VERSION=$(python3 -c 'import json; print(json.load(open("versions.json"))["app"])')
+          COMMIT_COUNT=$(git rev-list --count HEAD)
+          BUILD_NUMBER=$((COMMIT_COUNT + BUILD_NUMBER_OFFSET))
+
+          export APP_VERSION
+          export BUILD_NUMBER
+
+          echo "BUILD_NUMBER=$BUILD_NUMBER" >> "$GITHUB_ENV"
+          echo "APP_VERSION=$APP_VERSION" >> "$GITHUB_ENV"
+
+          python3 build-system/Make/ImportCertificates.py \
+            --path build-system/fake-codesigning/certs
+
           python3 -u build-system/Make/Make.py \
             --bazelUserRoot="$BAZEL_USER_ROOT" \
+            --cacheDir="$BAZEL_DISK_CACHE" \
             build \
             --configurationPath="build-system/appstore-configuration.json" \
             --codesigningInformationPath=build-system/fake-codesigning \
             --configuration=release_arm64 \
             --buildNumber="$BUILD_NUMBER" \
+            --enableParallelSwiftmoduleGeneration \
             --continueOnError
 
           OUTPUT_PATH="build/artifacts"
           rm -rf "$OUTPUT_PATH"
           mkdir -p "$OUTPUT_PATH"
 
-          echo "🔍 Looking for IPA file..."
+          echo "Looking for IPA file..."
           shopt -s nullglob
           for f in bazel-bin/Telegram/Telegram.ipa \
                    bazel-out/applebin_ios-*/bin/Telegram/Telegram.ipa \
                    bazel-out/applebin_ios-ios_arm*-opt-ST-*/bin/Telegram/Telegram.ipa; do
             if [ -f "$f" ]; then
               cp -v "$f" "$OUTPUT_PATH/"
-              echo "✅ Successfully copied: $f"
+              echo "Successfully copied: $f"
               break
             fi
           done
 
-          # DSYMs (без ошибки если нет)
+          if [ ! -f "$OUTPUT_PATH/Telegram.ipa" ]; then
+            echo "Telegram.ipa was not produced"
+            exit 1
+          fi
+
           mkdir -p build/DSYMs
           for f in bazel-out/applebin_ios-ios_arm*-opt-ST-*/bin/Telegram/*.dSYM; do
             cp -R "$f" build/DSYMs/ 2>/dev/null || true
           done
-          if [ -d "build/DSYMs" ] && [ "$(ls -A build/DSYMs 2>/dev/null)" ]; then
-            zip -r "./$OUTPUT_PATH/Telegram.DSYMs.zip" build/DSYMs 1>/dev/null || true
+
+          if [ -n "$(ls -A build/DSYMs 2>/dev/null)" ]; then
+            zip -r "./$OUTPUT_PATH/Telegram.DSYMs.zip" build/DSYMs >/dev/null || true
           fi
 
       - name: Upload Artifacts
@@ -101,8 +125,8 @@ jobs:
           name: Telegram-Build-${{ env.BUILD_NUMBER }}
           path: /Users/Shared/telegram-ios/build/artifacts/*
           retention-days: 30
+          if-no-files-found: error
 
-      # Опциональный релиз (не будет ломать билд при ошибке 403)
       - name: Create GitHub Release (optional)
         if: always()
         uses: softprops/action-gh-release@v2
@@ -110,7 +134,7 @@ jobs:
         with:
           tag_name: build-${{ env.BUILD_NUMBER }}
           name: Telegram ${{ env.APP_VERSION }} (${{ env.BUILD_NUMBER }})
-          body: "An unsigned build of Telegram for iOS ${{ env.APP_VERSION }} (${{ env.BUILD_NUMBER }})"
+          body: An unsigned build of Telegram for iOS ${{ env.APP_VERSION }} (${{ env.BUILD_NUMBER }})
           files: |
             /Users/Shared/telegram-ios/build/artifacts/Telegram.ipa
             /Users/Shared/telegram-ios/build/artifacts/Telegram.DSYMs.zip
